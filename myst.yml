@@ -1,0 +1,16 @@
+version: 1
+project:
+  title: База знаний SWE
+  description: База знаний по программной инженерии для подготовки к собеседованиям.
+  keywords:
+    - software engineering
+    - SWE
+    - собеседования
+  exclude:
+    - AGENTS.md
+    - raw/**
+    - work/**
+    - docs/superpowers/**
+site:
+  template: book-theme
+  title: База знаний SWE
