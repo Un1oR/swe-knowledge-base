@@ -1190,33 +1190,98 @@ Setting для включения Extended CONNECT семантически та
 
 ### Fallback на практике
 
-Практическая стратегия обычно осторожная. Клиент может предпочесть HTTP/3 или HTTP/2 Extended CONNECT, если negotiation и capabilities позволяют. `ALPN` здесь означает Application-Layer Protocol Negotiation: на этапе TLS или QUIC handshake стороны выбирают прикладной протокол вроде `http/1.1`, `h2` или `h3`. Если ALPN выбрал `h3` или `h2`, сервер объявил поддержку нужного setting, а клиентская библиотека и инфраструктура умеют такой режим, WebSocket frames идут внутри выбранного stream.
+Практический flow установления WebSocket-соединения начинается с WebSocket URI и набора возможных нижележащих HTTP-путей. Для `wss://example.com/chat` клиент знает схему `wss`, host, path и порт `443` по умолчанию. Дальше появляется важная развилка транспортного уровня: HTTP/1.1 и HTTP/2 используют TCP/TLS, а HTTP/3 использует QUIC поверх UDP. Из-за этой развилки схема выбора и fallback может распадаться на несколько connection candidates.
 
-Если поддержки H2/H3-варианта нет, самый совместимый путь часто остаётся HTTP/1.1 `Upgrade`. Здесь есть две разные ситуации. Если соединение уже было установлено как `http/1.1`, новое подключение не нужно: клиент может выполнить обычный `GET` с `Upgrade: websocket` в этом же HTTP/1.1 connection. Но если ALPN уже выбрал `h2` или `h3`, нельзя в том же соединении внезапно отправить HTTP/1.1 `GET` с `Upgrade: websocket`. Тогда нужен новый connection с другой negotiation или политикой, где будет выбран `http/1.1`, и уже там выполняется классический opening handshake.
+На уровне транспорта это две разные цепочки:
 
-На реальной системе итог зависит не только от браузера или клиента. Важны сервер, reverse proxy, CDN, load balancer, корпоративные прокси, настройки TLS/ALPN и конкретная библиотека. Поэтому корректная инженерная формулировка не "WebSocket поверх H2/H3 везде работает", а "стандартизованный механизм есть, но production path требует проверки поддержки на всём маршруте и fallback".
+```{mermaid}
+flowchart LR
+    WSS["wss://example.com/chat"] --> TCP["TCP/443"]
+    TCP --> TLS["TLS handshake"]
+    TLS --> H2H1["ALPN: h2 или http/1.1"]
+
+    WSS --> UDP["UDP/443"]
+    UDP --> QUIC["QUIC handshake<br/>with TLS 1.3"]
+    QUIC --> H3["ALPN: h3"]
+```
+
+В этой модели `ALPN` работает внутри конкретного handshake. В TCP/TLS path он выбирает между `h2` и `http/1.1`; в QUIC/TLS path он подтверждает `h3`. Поэтому полезно разделять два вопроса: как клиент получает транспортные кандидаты и что потом выбирается внутри каждого кандидата.
+
+TCP/TLS-кандидат есть у клиента без дополнительной разметки. Для `wss://example.com/chat` клиент может открыть TCP-соединение к `example.com:443`, выполнить TLS handshake с ALPN `h2, http/1.1` и получить от сервера выбранный HTTP-протокол. Если выбран `http/1.1`, дальше возможен классический WebSocket Upgrade. Если выбран `h2`, WebSocket возможен через Extended CONNECT, если сервер и весь маршрут объявляют и поддерживают этот режим.
+
+QUIC/HTTP/3-кандидат появляется из отдельных discovery-механизмов:
+
+- DNS `HTTPS`/`SVCB` record даёт сигнал до первого HTTP-ответа. Для WebSocket это применимо потому, что bootstrap всё равно использует HTTP connection machinery: RFC 9460 относит HTTP-based протоколы, включая WebSocket, к сценариям, где клиент может использовать `HTTPS` records. DNS может вернуть service binding с `alpn="h3"` и, при необходимости, alternative endpoint или параметры подключения. Тогда клиент уже на cold start может построить UDP/QUIC-кандидат, выполнить QUIC handshake и подтвердить `h3` через ALPN внутри QUIC/TLS.
+- `Alt-Svc` header появляется после ответа по уже доступному HTTP-пути, например после первого запроса через HTTP/2 или HTTP/1.1 к тому же origin. Ответ вида `Alt-Svc: h3=":443"; ma=86400` говорит клиенту, что тот же origin доступен через HTTP/3 на указанном endpoint'е. Клиент кэширует это знание на время `ma`, и следующие подключения к этому origin уже могут начинаться с QUIC-кандидата. `Alt-Svc` не меняет WebSocket URI и не переносит authority без проверки: клиент всё равно проверяет, что alternative service авторитетен для исходного origin.
+- Существующая сессия или connection pool сокращают выбор. Если у клиента уже есть активное QUIC-соединение к этому origin, следующий WebSocket-over-H3 можно пытаться открыть как новый stream в нём. Если есть пригодное HTTP/2-соединение, WebSocket-over-H2 аналогично начинается с нового Extended CONNECT stream.
+- Кэш неуспешного QUIC тоже влияет на выбор. Если клиент недавно видел, что UDP заблокирован, QUIC handshake не отвечает или HTTP/3 для origin помечен как broken, он может сразу идти TCP/TLS path и не тратить задержку на заведомо плохой UDP-кандидат.
+- Racing - это стратегия конкретной реализации, а не отдельный протокол. При наличии свежего `Alt-Svc` или DNS `HTTPS/SVCB` с `h3` клиент может запустить конкурирующие connection jobs: TCP/TLS как базовый путь и QUIC/UDP как alternative path. Дальше используется тот путь, который успешно установился и подходит политике клиента; если QUIC не установился, остаётся TCP path.
+
+Один и тот же WebSocket endpoint при этом может быть доступен одновременно через `TCP/443` для HTTP/1.1 или HTTP/2 и через `UDP/443` для HTTP/3: это разные transport endpoints, они не конфликтуют.
+
+Схематически discovery-часть выглядит так:
 
 ```{mermaid}
 flowchart TD
-    Start[Need WebSocket] --> Alpn{Selected protocol}
-    Alpn -->|http/1.1| H1[Use H1 Upgrade]
-    Alpn -->|h2 or h3| Ext{Extended CONNECT available}
-    Ext -->|Yes| Conn[Open CONNECT stream]
-    Conn --> Ok{Status 200}
-    Ok -->|Yes| Stream[WS frames on stream]
-    Ok -->|No| NewConn[Open new H1 connection]
-    Ext -->|No| NewConn
-    NewConn --> H1
-    H1 --> Classic[WS frames on connection]
+    URI["wss://example.com/chat"] --> Pool{"Есть пригодный<br/>H2/H3 connection?"}
+    Pool -->|Да| Reuse["Открыть новый<br/>Extended CONNECT stream"]
+    Pool -->|Нет| Build["Построить connection candidates"]
+
+    Build --> TCP["Базовый TCP/TLS candidate<br/>ALPN: h2, http/1.1"]
+    Build --> DNS["DNS HTTPS/SVCB<br/>с h3"]
+    Build --> AltSvc["Свежий Alt-Svc<br/>с h3 в кэше"]
+
+    DNS --> H3Cold["QUIC/UDP candidate<br/>до первого HTTP-ответа"]
+    AltSvc --> H3Next["QUIC/UDP candidate<br/>для следующего подключения"]
+    H3Cold --> H3Candidate["QUIC/UDP candidate"]
+    H3Next --> H3Candidate
+    H3Candidate --> Broken{"UDP/H3 недавно<br/>ломался для origin?"}
+    Broken -->|Да| Lower["Пропустить или понизить<br/>приоритет QUIC"]
+    Broken -->|Нет| H3["QUIC/TLS ALPN: h3"]
+
+    TCP --> Strategy{"Connection strategy"}
+    H3 --> Strategy
+    Lower --> Strategy
+
+    Strategy -->|Только TCP path| TCPConn["TCP/TLS connection"]
+    Strategy -->|QUIC path выбран| QUICConn["QUIC connection"]
+    Strategy -->|Реализация запускает racing| Race["Конкурирующие TCP и QUIC jobs"]
+    Race --> Winner{"Какой path успешно<br/>установился и принят политикой?"}
+    Winner -->|TCP| TCPConn
+    Winner -->|QUIC| QUICConn
 ```
 
-Эта схема намеренно не показывает все сетевые детали. Важная развилка такая: если уже выбран `http/1.1`, классический Upgrade можно делать в текущем HTTP/1.1 connection; если выбран `h2` или `h3`, WebSocket живёт в stream только при доступном Extended CONNECT. Если Extended CONNECT недоступен или неуспешен, fallback на HTTP/1.1 требует нового connection.
+После выбора HTTP-версии начинается WebSocket-specific развилка. Если соединение установлено как `http/1.1`, клиент может выполнить классический `GET` с `Upgrade: websocket` в этом HTTP/1.1 connection. Если выбран `h2` или `h3`, WebSocket открывается не через connection-wide Upgrade, а через Extended CONNECT внутри отдельного stream. Для этого должны совпасть несколько условий: выбранный протокол поддерживается клиентской библиотекой, сервер объявил нужную поддержку через settings, а промежуточная инфраструктура не ломает такой путь.
+
+Если HTTP/2/HTTP/3 Extended CONNECT недоступен или запрос неуспешен, fallback на HTTP/1.1 требует нового connection. Нельзя внутри уже выбранного `h2` или `h3` соединения внезапно отправить HTTP/1.1 `GET` с `Upgrade: websocket`: wire-format и состояние соединения уже другие. Клиент должен открыть отдельный TCP/TLS path с такой negotiation или политикой, где будет выбран `http/1.1`, и уже там выполнить классический opening handshake.
+
+На реальной системе итог зависит не только от браузера или клиента. Важны сервер, reverse proxy, CDN, load balancer, корпоративные прокси, настройки TLS/ALPN, доступность UDP и конкретная библиотека.
+
+После discovery можно свернуть WebSocket-specific часть до отдельной схемы:
+
+```{mermaid}
+flowchart TD
+    Path["Выбранный HTTP path"] --> Proto{"HTTP protocol"}
+
+    Proto -->|http/1.1| H1["GET /chat<br/>Upgrade: websocket"]
+    H1 --> H1101{"101 Switching Protocols?"}
+    H1101 -->|Да| Classic["WS frames<br/>on connection"]
+    H1101 -->|Нет| Fail["Opening handshake failed"]
+
+    Proto -->|h2 или h3| Ext{"Extended CONNECT<br/>доступен?"}
+    Ext -->|Да| Connect["CONNECT<br/>:protocol = websocket"]
+    Connect --> Status{"Status 200?"}
+    Status -->|Да| Stream["WS frames<br/>on stream"]
+    Status -->|Нет| NewH1["Открыть новый<br/>HTTP/1.1 connection"]
+    Ext -->|Нет| NewH1
+    NewH1 --> H1
+```
 
 ### Как это формулировать на интервью
 
 Короткая версия:
 
-> Классический WebSocket поверх HTTP/1.1 использует `GET` + `Upgrade`, успешный ответ `101 Switching Protocols`, `Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key` и `Sec-WebSocket-Accept`. В HTTP/2 и HTTP/3 connection-wide Upgrade не подходит, потому что одно соединение несёт много streams. Для этого есть Extended CONNECT: запрос идёт как `:method = CONNECT` с `:protocol = websocket`, `:scheme`, `:path` и `:authority`; при успехе приходит `:status = 200`, и дальше WebSocket frames идут внутри одного H2/H3 stream. В HTTP/2 сервер должен объявить `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`; без этого клиент не должен считать механизм доступным. В HTTP/3 идея переносится на QUIC streams, setting зарегистрирован отдельно, а TCP-level HOL между streams исчезает, потому что TCP там нет. Несколько WebSocket на одном TCP возможно только в варианте WS-over-H2 как разные streams; классический HTTP/1.1 Upgrade занимает один TCP одним WS. ALPN выбирает `http/1.1`, `h2` или `h3` при установлении защищённого соединения. Если уже выбран `http/1.1`, Upgrade можно делать в этом соединении; если уже выбран `h2`/`h3` и Extended CONNECT недоступен, fallback на HTTP/1.1 требует нового connection.
+> Классический WebSocket начинается с URI `ws://` или `wss://`; для защищённого варианта `wss://` клиент сначала устанавливает TCP и TLS, а затем отправляет HTTP/1.1 `GET` + `Upgrade`. При успехе сервер отвечает `101 Switching Protocols`, и дальше по тому же соединению идут WebSocket frames. В HTTP/2 и HTTP/3 connection-wide Upgrade не подходит, потому что одно нижнее соединение несёт много streams. Для этого есть Extended CONNECT: запрос идёт как `:method = CONNECT` с `:protocol = websocket`; при успехе приходит `:status = 200`, и дальше WebSocket frames идут внутри одного H2/H3 stream. В HTTP/2 сервер должен объявить `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`; в HTTP/3 используется отдельная настройка для той же идеи поверх QUIC streams. В практическом flow сначала строятся транспортные кандидаты. TCP/TLS path доступен без отдельной разметки и через ALPN выбирает `h2` или `http/1.1`. QUIC/UDP path появляется либо заранее из DNS `HTTPS/SVCB` с `h3`, либо из кэша `Alt-Svc`, который был получен после предыдущего HTTP-ответа, либо из уже открытой QUIC-сессии. Некоторые клиенты при наличии свежего H3-сигнала запускают TCP и QUIC как конкурирующие connection jobs; если QUIC не отвечает или origin помечен как broken for QUIC, используется TCP/TLS path. TCP/443 и UDP/443 могут одновременно обслуживать один WebSocket endpoint. Если уже выбран `http/1.1`, Upgrade можно делать в этом соединении; если уже выбран `h2`/`h3` и Extended CONNECT недоступен, fallback на HTTP/1.1 требует нового connection.
 
 ## Как это выглядит в коде
 
