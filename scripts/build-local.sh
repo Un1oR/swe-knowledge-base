@@ -39,4 +39,5 @@ echo "effective node: $(command -v node)" >&2
 echo "effective npm: $(command -v npm)" >&2
 
 cd "$REPO_ROOT"
-exec "$MYST" build --html "$@"
+"$MYST" build --html "$@"
+"$REPO_ROOT/.venv/bin/python" "$SCRIPT_DIR/add_site_verification.py"

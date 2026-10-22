@@ -44,7 +44,10 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Build MyST HTML
-        run: myst build --html
+        run: |
+          python -m unittest discover -s scripts
+          myst build --html
+          python scripts/add_site_verification.py
 
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
