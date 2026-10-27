@@ -6,6 +6,7 @@ project:
     - software engineering
     - SWE
     - собеседования
+    - разработка ПО
   exclude:
     - AGENTS.md
     - raw/**
